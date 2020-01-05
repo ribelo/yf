@@ -23,7 +23,7 @@
             :or   {start    "2000-01-01"
                    end      (jt/format (jt/local-date))
                    interval "1d"}}]
-   (if-let [[cookies crumb] (get-cookie&crumb symbol)]
+   (if-let [(get-cookie&crumb symbol)]
      (let [url        "https://query1.finance.yahoo.com/v7/finance/download/%s?period1=%s&period2=%s&interval=%s&events=%s&crumb=%s"
            start-time (str-time->epoch start)
            end-time   (str-time->epoch end)
@@ -43,8 +43,7 @@
                    (drop 1)
                    (map #(str/split % #","))
                    (map (fn [[date open high low close _ volume]]
-                          {:symbol (str/lower-case symbol)
-                           :date   (jt/local-date date)
+                          {:date   (jt/local-date date)
                            :open   (e/as-?float open)
                            :high   (e/as-?float high)
                            :low    (e/as-?float low)
