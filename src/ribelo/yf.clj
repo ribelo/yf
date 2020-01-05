@@ -23,7 +23,7 @@
             :or   {start    "2000-01-01"
                    end      (jt/format (jt/local-date))
                    interval "1d"}}]
-   (if-let [(get-cookie&crumb symbol)]
+   (if-let [[cookies crumb] (get-cookie&crumb symbol)]
      (let [url        "https://query1.finance.yahoo.com/v7/finance/download/%s?period1=%s&period2=%s&interval=%s&events=%s&crumb=%s"
            start-time (str-time->epoch start)
            end-time   (str-time->epoch end)
