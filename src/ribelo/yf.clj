@@ -536,15 +536,29 @@
 
 (defn company-profile [symbol]
   (->> (get-profile-htree (str/upper-case symbol))
-       (hs/select (hs/descendant
-                   (hs/attr :data-test #(= % "asset-profile"))
-                   (hs/tag :div)
-                   (hs/nth-of-type 2 :p)))
-       first
-       :content
-       (mapv :content)
-       ((fn [{[sector _] 4 [industry _] 10 [employees _] 16}]
-          (let [employees (-> employees :content first (str/replace "," "") (e/as-?float))]
-            {:sector    (str/lower-case sector)
-             :industry  (str/lower-case industry)
-             :employees employees})))))
+      (hs/select (hs/descendant
+                  (hs/attr :data-test #(= % "asset-profile"))
+                  (hs/tag :div)
+                  (hs/nth-of-type 2 :p)))
+      first
+      :content
+      (mapv :content)
+      ((fn [{[sector _] 4 [industry _] 10 [employees _] 16}]
+         (let [employees (-> employees :content first (str/replace "," "") (e/as-?float))]
+           {:sector    (str/lower-case sector)
+            :industry  (str/lower-case industry)
+            :employees employees})))))
+
+(defn symbol-name [symbol]
+  (->> (memoized-http-get (str "https://finance.yahoo.com/quote/" (str/upper-case symbol)))
+      :body
+      (hc/parse)
+      (hc/as-hickory)
+      (hs/select (hs/descendant
+                  (hs/id "quote-header-info")
+                  (hs/tag :h1)))
+      first
+      :content
+      first
+      str/lower-case
+      ((fn [s] (-> s (str/split #"-") second (str/trim))))))
