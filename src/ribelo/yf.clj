@@ -33,14 +33,14 @@
 
 (defn get-cookie&crumb [symbol]
   (try-times {:max-retries 5 :sleep 3000}
-    (let [url     "https://finance.yahoo.com/quote/%s/history"
-          resp    (http/get (format url (str/upper-case (name symbol))))
-          cookies (:cookies resp)
-          body    (:body resp)
-          crumb   (second (re-find #"\"CrumbStore\":\{\"crumb\":\"(.{11})\"\}" body))]
-      (if crumb
-        [cookies crumb]
-        (throw (ex-info "empty response" {:symbol symbol}))))))
+             (let [url     "https://finance.yahoo.com/quote/%s/history"
+                   resp    (http/get (format url (str/upper-case (name symbol))))
+                   cookies (:cookies resp)
+                   body    (:body resp)
+                   crumb   (second (re-find #"\"CrumbStore\":\{\"crumb\":\"(.{11})\"\}" body))]
+               (if crumb
+                 [cookies crumb]
+                 (throw (ex-info "empty response" {:symbol symbol}))))))
 
 (defn get-data
   ([symbol] (get-data symbol {}))
@@ -239,7 +239,6 @@
        (find-value-by-description #"(?i)^quarterly earnings growth$")
        (->value)))
 
-
 (defn total-cash [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^total cash$")
@@ -375,7 +374,6 @@
        (find-value-by-description #"(?i)^forward annual dividend yield$")
        (->value)))
 
-
 (defn trailing-annual-dividend-rate [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^trailing annual dividend rate$")
@@ -461,12 +459,12 @@
 (defn stock-price-history [symbol]
   (when (stock? symbol)
     {:beta                  (beta symbol)
-     :52-week-change        (week-change-52 symbol)
-     :s&p500-52-week-change (s&p500-week-change-52 symbol)
-     :52-week-high          (week-high-52 symbol)
-     :52-week-low           (week-low-52 symbol)
-     :50-day-ma             (day-ma-50 symbol)
-     :200-day-ma            (day-ma-200 symbol)}))
+     :week-change-52        (week-change-52 symbol)
+     :sp500-52-week-change (s&p500-week-change-52 symbol)
+     :week-high-52          (week-high-52 symbol)
+     :week-low-52           (week-low-52 symbol)
+     :day-ma-50             (day-ma-50 symbol)
+     :day-ma-200            (day-ma-200 symbol)}))
 
 (defn share-statistics [symbol]
   (when (stock? symbol)
@@ -479,7 +477,7 @@
      :shares-short                        (shares-short symbol)
      :short-ratio                         (short-ratio symbol)
      :short-percent-of-float              (short-percent-of-float symbol)
-     :short-percent-of-shares-outstanding (short-percent-of-shares-outstanding symbol)} ))
+     :short-percent-of-shares-outstanding (short-percent-of-shares-outstanding symbol)}))
 
 (defn dividends [symbol]
   (when (stock? symbol)
@@ -491,7 +489,6 @@
      :payout-ratio                   (payout-ratio symbol)
      :dividend-date                  (dividend-date symbol)
      :ex-dividend-date               (ex-dividend-date symbol)}))
-
 
 (def ^:private get-profile-htree
   (e/memoize
@@ -536,29 +533,29 @@
 
 (defn company-profile [symbol]
   (->> (get-profile-htree (str/upper-case symbol))
-      (hs/select (hs/descendant
-                  (hs/attr :data-test #(= % "asset-profile"))
-                  (hs/tag :div)
-                  (hs/nth-of-type 2 :p)))
-      first
-      :content
-      (mapv :content)
-      ((fn [{[sector _] 4 [industry _] 10 [employees _] 16}]
-         (let [employees (-> employees :content first (str/replace "," "") (e/as-?float))]
-           {:sector    (str/lower-case sector)
-            :industry  (str/lower-case industry)
-            :employees employees})))))
+       (hs/select (hs/descendant
+                   (hs/attr :data-test #(= % "asset-profile"))
+                   (hs/tag :div)
+                   (hs/nth-of-type 2 :p)))
+       first
+       :content
+       (mapv :content)
+       ((fn [{[sector _] 4 [industry _] 10 [employees _] 16}]
+          (let [employees (-> employees :content first (str/replace "," "") (e/as-?float))]
+            {:sector    (str/lower-case sector)
+             :industry  (str/lower-case industry)
+             :employees employees})))))
 
 (defn symbol-name [symbol]
   (->> (memoized-http-get (str "https://finance.yahoo.com/quote/" (str/upper-case symbol)))
-      :body
-      (hc/parse)
-      (hc/as-hickory)
-      (hs/select (hs/descendant
-                  (hs/id "quote-header-info")
-                  (hs/tag :h1)))
-      first
-      :content
-      first
-      str/lower-case
-      ((fn [s] (-> s (str/split #"-") second (str/trim))))))
+       :body
+       (hc/parse)
+       (hc/as-hickory)
+       (hs/select (hs/descendant
+                   (hs/id "quote-header-info")
+                   (hs/tag :h1)))
+       first
+       :content
+       first
+       str/lower-case
+       ((fn [s] (-> s (str/split #"-") second (str/trim))))))
