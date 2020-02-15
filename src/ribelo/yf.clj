@@ -110,7 +110,7 @@
 
 (defn- ->value [s]
   (when (and (identity s) (string? s))
-    (let [num  (->> s (re-find #"([0-9]*.[0-9]+|[0-9]+)") first e/as-float)
+    (let [num  (->> (clojure.string/replace s #"," "") (re-find #"([0-9]*.[0-9]+|[0-9]+)") first e/as-float)
           unit (last s)]
       (when num
         (* (e/as-float num) (unit->value (str/lower-case unit) 1.0))))))
