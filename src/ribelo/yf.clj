@@ -364,12 +364,12 @@
        (find-value-by-description #"(?i)^short \% of shares outstanding \(.+\)$")
        (->value)))
 
-(defn forward-annual-divident-rate [symbol]
+(defn forward-annual-dividend-rate [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^forward annual dividend rate$")
        (->value)))
 
-(defn forward-annual-divident-yield [symbol]
+(defn forward-annual-dividend-yield [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^forward annual dividend yield$")
        (->value)))
@@ -481,8 +481,8 @@
 
 (defn dividends [symbol]
   (when (stock? symbol)
-    {:forward-annual-divident-rate     (forward-annual-divident-rate symbol)
-     :forward-annual-divident-yield    (forward-annual-divident-yield symbol)
+    {:forward-annual-dividend-rate     (forward-annual-dividend-rate symbol)
+     :forward-annual-dividend-yield    (forward-annual-dividend-yield symbol)
      :trailing-annual-dividend-rate    (trailing-annual-dividend-rate symbol)
      :trailing-annual-dividend-yield   (trailing-annual-dividend-yield symbol)
      :five-year-average-dividend-yield (_5-year-average-dividend-yield symbol)
