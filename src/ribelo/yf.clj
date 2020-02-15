@@ -481,14 +481,14 @@
 
 (defn dividends [symbol]
   (when (stock? symbol)
-    {:forward-annual-divident-rate   (forward-annual-divident-rate symbol)
-     :forward-annual-divident-yield  (forward-annual-divident-yield symbol)
-     :trailing-annual-dividend-rate  (trailing-annual-dividend-rate symbol)
-     :trailing-annual-dividend-yield (trailing-annual-dividend-yield symbol)
-     :5-year-average-dividend-yield  (_5-year-average-dividend-yield symbol)
-     :payout-ratio                   (payout-ratio symbol)
-     :dividend-date                  (dividend-date symbol)
-     :ex-dividend-date               (ex-dividend-date symbol)}))
+    {:forward-annual-divident-rate     (forward-annual-divident-rate symbol)
+     :forward-annual-divident-yield    (forward-annual-divident-yield symbol)
+     :trailing-annual-dividend-rate    (trailing-annual-dividend-rate symbol)
+     :trailing-annual-dividend-yield   (trailing-annual-dividend-yield symbol)
+     :five-year-average-dividend-yield (_5-year-average-dividend-yield symbol)
+     :payout-ratio                     (payout-ratio symbol)
+     :dividend-date                    (dividend-date symbol)
+     :ex-dividend-date                 (ex-dividend-date symbol)}))
 
 (def ^:private get-profile-htree
   (e/memoize
