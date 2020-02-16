@@ -541,10 +541,9 @@
        :content
        (mapv :content)
        ((fn [{[sector _] 4 [industry _] 10 [employees _] 16}]
-          (let [employees]
-            {:sector    (some-> sector (str/lower-case))
-             :industry  (some-> industry (str/lower-case))
-             :employees (some-> employees :content first (str/replace "," "") (e/as-?float))})))))
+          {:sector    (some-> sector (str/lower-case))
+           :industry  (some-> industry (str/lower-case))
+           :employees (some-> employees :content first (str/replace "," "") (e/as-?float))}))))
 
 (defn symbol-name [symbol]
   (->> (memoized-http-get (str "https://finance.yahoo.com/quote/" (str/upper-case symbol)))
