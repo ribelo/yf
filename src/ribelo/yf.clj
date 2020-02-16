@@ -110,10 +110,10 @@
 
 (defn- ->value [s]
   (when (and (identity s) (string? s))
-    (let [num  (->> (clojure.string/replace s #"," "") (re-find #"([0-9]*.[0-9]+|[0-9]+)") first e/as-float)
+    (let [num  (->> (clojure.string/replace s #"," "") (re-find #"([0-9]*.[0-9]+|[0-9]+)") first e/as-?float)
           unit (last s)]
       (when num
-        (* (e/as-float num) (unit->value (str/lower-case unit) 1.0))))))
+        (* num (unit->value (str/lower-case unit) 1.0))))))
 
 (defn- find-value-by-description [re htree]
   (->> htree
