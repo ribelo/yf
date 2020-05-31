@@ -4,7 +4,6 @@
    [taoensso.encore :as e]
    [clj-http.client :as http]
    [clojure.string :as str]
-   [java-time :as jt]
    [hickory.core :as hc]
    [hickory.select :as hs]))
 
@@ -68,7 +67,7 @@
                    (drop 1)
                    (map #(str/split % #","))
                    (map (fn [[date open high low close _ volume]]
-                          {:date   (jt/local-date date)
+                          {:date   date
                            :open   (e/as-?float open)
                            :high   (e/as-?float high)
                            :low    (e/as-?float low)
@@ -458,13 +457,13 @@
 
 (defn stock-price-history [symbol]
   (when (stock? symbol)
-    {:beta                  (beta symbol)
-     :week-change-52        (week-change-52 symbol)
+    {:beta                 (beta symbol)
+     :week-change-52       (week-change-52 symbol)
      :sp500-52-week-change (s&p500-week-change-52 symbol)
-     :week-high-52          (week-high-52 symbol)
-     :week-low-52           (week-low-52 symbol)
-     :day-ma-50             (day-ma-50 symbol)
-     :day-ma-200            (day-ma-200 symbol)}))
+     :week-high-52         (week-high-52 symbol)
+     :week-low-52          (week-low-52 symbol)
+     :day-ma-50            (day-ma-50 symbol)
+     :day-ma-200           (day-ma-200 symbol)}))
 
 (defn share-statistics [symbol]
   (when (stock? symbol)
