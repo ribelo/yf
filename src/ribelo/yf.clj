@@ -1,14 +1,13 @@
 (ns ribelo.yf
   (:refer-clojure :exclude [float])
   (:require
+   [clojure.string]
    [taoensso.encore :as e]
-   [clj-http.client :as http]
-   [java-time :as jt]
-   [jsonista.core :as json]
+   [hato.client :as http]
    [hickory.core :as hc]
    [hickory.select :as hs]
    [cuerdas.core :as str]
-   [meander.epsilon :as m]))
+   [ribelo.pathos :as p]))
 
 (defmacro try-times
   {:style/indent 1}
@@ -24,16 +23,16 @@
            (Thread/sleep ~sleep))
          (recur (inc i#))))))
 
-(defn str-time->epoch [s]
-  (quot (jt/to-millis-from-epoch (jt/java-date (jt/local-date s) (jt/zone-offset 0))) 1000))
+(defn- str-time->epoch [s]
+  (quot (.getTime (.parse (e/simple-date-format "yyyy-MM-dd" :timezone :utc) s)) 1000))
 
-(def memoized-http-get
+(def ^:private memoized-http-get
   (e/memoize
       (fn
         ([url opts] (http/get url opts))
         ([url] (memoized-http-get url {})))))
 
-(defn get-cookie&crumb [symbol]
+(defn- get-crumb [symbol]
   (try-times {:max-retries 5 :sleep 3000}
     (let [url     "https://finance.yahoo.com/quote/%s/history"
           resp    (http/get (format url (str/upper (name symbol))))
@@ -44,43 +43,56 @@
         [cookies crumb]
         (throw (ex-info "empty response" {:symbol symbol}))))))
 
-(defn get-data
-  ([symbol] (get-data symbol {}))
-  ([symbol {:keys [start end interval]
-            :or   {start    "2000-01-01"
-                   end      (jt/format (jt/local-date))
-                   interval "1d"}}]
-   (if-let [[cookies crumb] (get-cookie&crumb symbol)]
-     (let [url        "https://query1.finance.yahoo.com/v7/finance/download/%s?period1=%s&period2=%s&interval=%s&events=%s&crumb=%s"
-           start-time (str-time->epoch start)
-           end-time   (str-time->epoch end)
-           event      "history"]
-       (->> (http/get (format url
-                              (str/upper (name symbol))
-                              start-time
-                              end-time
-                              interval
-                              event
-                              crumb)
-                      {:cookies cookies})
-            :body
-            str/lines
-            (into []
-                  (comp
-                    (drop 1)
-                    (map #(str/split % #","))
-                    (map (fn [[date open high low close _ volume]]
-                           {:date   date
-                            :open   (e/as-?float open)
-                            :high   (e/as-?float high)
-                            :low    (e/as-?float low)
-                            :close  (e/as-?float close)
-                            :volume (e/as-?float volume)}))
-                    (filter (fn [m] (every? identity (vals m))))))))
-     (throw (ex-info "empty response" {:symbol symbol})))))
+(defn- get-data
+  ([ticker] (get-data ticker {}))
+  ([ticker {:keys [start-time end-time interval]
+            :or   {start-time "2000-01-01"
+                   end-time   (.format (e/simple-date-format "yyyy-MM-dd") (java.util.Date.))
+                   interval   "1d"}}]
+   (e/if-let [crumb       (get-crumb ticker)
+              url         "https://query1.finance.yahoo.com/v7/finance/download/%s?period1=%s&period2=%s&interval=%s&events=%s&crumb=%s"
+              start-time* (str-time->epoch start-time)
+              end-time*   (str-time->epoch end-time)
+              event       "history"]
+     (->> (http/get (format url
+                            (str/upper (name ticker))
+                            start-time*
+                            end-time*
+                            interval
+                            event
+                            crumb))
+          :body
+          str/lines
+          (into []
+                (comp
+                 (drop 1)
+                 (map #(str/split % #","))
+                 (map (fn [[date open high low close _ volume]]
+                        {:date   date
+                         :open   (e/as-?float open)
+                         :high   (e/as-?float high)
+                         :low    (e/as-?float low)
+                         :close  (e/as-?float close)
+                         :volume (e/as-?int volume)}))
+                 (map (partial p/add-ns-to-map :yf.quotes))
+                 (filter (fn [m] (every? identity (vals m)))))))
+     (throw (ex-info "empty response" {:symbol ticker})))))
 
+(p/reg-resolver ::quotes
+  [{:yf/keys [ticker start-time end-time]}]
+  {::p/memoize [(e/ms :mins 5)]
+   ::p/input   [:yf/ticker]
+   ::p/output  [{:yf/quotes [:yf.quotes/date :yf.quotes/open :yf.quotes/high
+                             :yf.quotes/low :yf.quotes/close :yf.quotes/volume]}]}
+  (println ticker start-time end-time)
+  {:yf/quotes
+   (get-data ticker (e/assoc-some {}
+                                  :start-time start-time
+                                  :end-time   end-time))})
 (comment
-  (get-data "msft"))
+  (p/eql {:yf/ticker :msft
+          :yf/start-time "2020-01-02"} [:yf/quotes]))
+
 
 (defn stock? [symbol]
   (->> (memoized-http-get (str "https://finance.yahoo.com/quote/" (str/upper symbol)))
@@ -120,179 +132,230 @@
    "%" 0.01})
 
 (defn- ->value [s]
-  (when (and (identity s) (string? s))
+  (when (string? s)
     (let [num  (->> (clojure.string/replace s #"," "") (re-find #"([0-9]*.[0-9]+|[0-9]+)") first e/as-?float)
-          unit (last s)]
+          unit (str (last s))]
       (when num
         (* num (unit->value (str/lower unit) 1.0))))))
 
 (defn- find-value-by-description [re htree]
   (->> htree
        (hs/select (hs/follow
-                    (hs/has-child (hs/find-in-text re))
-                    (hs/tag :td)))
+                   (hs/has-child (hs/find-in-text re))
+                   (hs/tag :td)))
        first
        :content
        first))
 
-(defn market-cap [symbol]
-  (->> (get-key-stats-htree symbol)
+(defn market-cap [ticker]
+  (->> (get-key-stats-htree ticker)
        (find-value-by-description #"(?i)^market cap")
        (->value)))
 
-(comment
-  (market-cap "msft"))
+(p/reg-resolver ::market-cap
+  [{:yf/keys [ticker]}]
+  {:yf/market-cap (market-cap ticker)})
 
-(defn enterprise-value [symbol]
-  (->> (get-key-stats-htree symbol)
+(comment
+  (p/eql {:yf/ticker "msft"} [:yf/market-cap]))
+
+(defn enterprise-value [ticker]
+  (->> (get-key-stats-htree ticker)
        (find-value-by-description #"(?i)^enterprise value")
        (->value)))
 
+(p/reg-resolver ::enterprise-value
+  [{:yf/keys [ticker]}]
+  {:yf/enterprise-value (enterprise-value ticker)})
+
 (comment
-  (enterprise-value "msft"))
+  (p/eql {:yf/ticker "msft"} [:yf/enterprise-value]))
 
 (defn trailing-pe-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^trailing p/e")
        (->value)))
 
+(p/reg-resolver ::trailing-pe-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/trailing-pe-ratio (trailing-pe-ratio ticker)})
+
 (comment
-  (trailing-pe-ratio "msft"))
+  (p/eql {:yf/ticker "msft"} [:yf/trailing-pe-ratio]))
 
 (defn forward-pe-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^forward p/e")
        (->value)))
 
+(p/reg-resolver ::forward-pe-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/forward-pe-ratio (forward-pe-ratio ticker)})
+
 (comment
-  (forward-pe-ratio "msft"))
+  (p/eql {:yf/ticker "msft"} [:yf/forward-pe-ratio]))
 
 (defn peg-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^peg ratio")
        (->value)))
 
+(p/reg-resolver ::peg-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/peg-ratio (peg-ratio ticker)})
+
 (comment
-  (peg-ratio "msft")
-  ;; => 2.28
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/peg-ratio]))
 
 (defn price-to-sales-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^price/sales")
        (->value)))
 
+(p/reg-resolver ::price-to-sales-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/price-to-sales-ratio (price-to-sales-ratio ticker)})
+
 (comment
-  (price-to-sales-ratio "msft")
-  ;; => 11.79
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/price-to-sales-ratio]))
 
 (defn price-to-book-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^enterprise value")
        (->value)))
 
+(p/reg-resolver ::price-to-book-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/price-to-book-ratio (price-to-book-ratio ticker)})
+
 (comment
-  (price-to-book-ratio "msft")
-  ;; => 1.69
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/price-to-book-ratio]))
 
 (defn enterprise-value-to-revenue-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^enterprise value/revenue")
        (->value)))
 
+(p/reg-resolver ::enterprise-value-to-revenue-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/enterprise-value-to-revenue-ratio (enterprise-value-to-revenue-ratio ticker)})
+
 (comment
-  (enterprise-value-to-revenue-ratio "msft")
-  ;; => 11.03
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/enterprise-value-to-revenue-ratio]))
 
 (defn enterprise-value-to-ebitda-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^enterprise value/ebitda")
        (->value)))
 
+(p/reg-resolver ::enterprise-value-to-ebitda-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/enterprise-value-to-ebitda-ratio (enterprise-value-to-ebitda-ratio ticker)})
+
 (comment
-  (enterprise-value-to-ebitda-ratio "msft")
-  ;; => 23.58
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/enterprise-value-to-ebitda-ratio]))
 
 (defn fiscal-year-ends [symbol]
   (when-let [s (->> (get-key-stats-htree symbol)
                     (find-value-by-description #"(?i)^fiscal year ends"))]
-    (when (string? s) (jt/local-date "LLL dd, yyyy" s))))
+    (when (string? s)
+      (.format
+       (e/simple-date-format "yyyy-MM-dd" :timezone :utc)
+       (.parse (e/simple-date-format "LLL dd, yyyy" :timezone :utc) s)))))
+
+(p/reg-resolver ::fiscal-year-ends
+  [{:yf/keys [ticker]}]
+  {:yf/fiscal-year-ends (fiscal-year-ends ticker)})
 
 (comment
-  (jt/local-date "yyyy-MM-dd" "2020-01-01")
-  (jt/local-date "dd LLL yyyy" "16 May 2018")
-  (fiscal-year-ends "msft")
-  ;; => #object[java.time.LocalDate 0x109b8b40 "2020-06-29"]
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/fiscal-year-ends]))
 
 (defn most-recent-quarter [symbol]
   (when-let [s (->> (get-key-stats-htree symbol)
                     (find-value-by-description #"(?i)^most recent quarter"))]
-    (when (string? s) (jt/local-date "LLL dd, yyyy" s))))
+    (when (string? s)
+      (.format
+       (e/simple-date-format "yyyy-MM-dd" :timezone :utc)
+       (.parse (e/simple-date-format "LLL dd, yyyy" :timezone :utc) s)))))
+
+(p/reg-resolver ::most-recent-quarter
+  [{:yf/keys [ticker]}]
+  {:yf/most-recent-quarter (most-recent-quarter ticker)})
 
 (comment
-  (most-recent-quarter "msft")
-  ;; => #object[java.time.LocalDate 0x34386d21 "2020-12-30"]
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/most-recent-quarter]))
 
 (defn profit-margin [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^profit margin")
        (->value)))
 
+(p/reg-resolver ::profit-margin
+  [{:yf/keys [ticker]}]
+  {:yf/profit-margin (profit-margin ticker)})
+
 (comment
-  (profit-margin "msft")
-  ;; => 33.47
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/profit-margin]))
 
 (defn operating-margin [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^operating margin")
        (->value)))
 
+(p/reg-resolver ::operating-margin
+  [{:yf/keys [ticker]}]
+  {:yf/operating-margin (operating-margin ticker)})
+
 (comment
-  (operating-margin "msft")
-  ;; => 39.24
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/operating-margin]))
 
 (defn roa [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^return on assets")
        (->value)))
 
+(p/reg-resolver ::roa
+  [{:yf/keys [ticker]}]
+  {:yf/roa (roa ticker)})
+
 (comment
-  (roa "msft")
-  ;; => 12.81
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/roa]))
 
 (defn roe [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^return on equity")
        (->value)))
 
+(p/reg-resolver ::roe
+  [{:yf/keys [ticker]}]
+  {:yf/roe (roe ticker)})
+
 (comment
-  (roe "msft")
-  ;; => 42.7
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/roe]))
 
 (defn revenue [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^revenue$")
        (->value)))
 
-(comment
-  (revenue "msft")
-  ;; => 153.28
-  )
-
 (defn revenue-per-share [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^revenue per share")
        (->value)))
+
+(p/reg-resolver ::revenue-per-share
+  [{:yf/keys [ticker]}]
+  {:yf/revenue-per-share (revenue-per-share ticker)})
+
+(comment
+  (p/eql {:yf/ticker "msft"} [:yf/revenue-per-share]))
+
+(p/reg-resolver ::revenue
+  [{:yf/keys [ticker]}]
+  {:yf/revenue (revenue ticker)})
+
+(comment
+  (p/eql {:yf/ticker "msft"} [:yf/revenue]))
 
 (comment
   (revenue-per-share "msft")
@@ -304,600 +367,488 @@
        (find-value-by-description #"(?i)^quarterly revenue growth$")
        (->value)))
 
+(p/reg-resolver ::quarterly-revenue-growth
+  [{:yf/keys [ticker]}]
+  {:yf/quarterly-revenue-growth (quarterly-revenue-growth ticker)})
+
 (comment
-  (quarterly-revenue-growth "msft")
-  ;; => 16.7
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/quarterly-revenue-growth]))
 
 (defn gross-profit [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^gross profit$")
        (->value)))
 
+(p/reg-resolver ::gross-profit
+  [{:yf/keys [ticker]}]
+  {:yf/gross-profit (gross-profit ticker)})
+
 (comment
-  (gross-profit "msft")
-  ;; => 96.94
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/gross-profit]))
 
 (defn ebitda [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^ebitda$")
        (->value)))
 
+(p/reg-resolver ::ebitda
+  [{:yf/keys [ticker]}]
+  {:yf/ebitda (ebitda ticker)})
+
 (comment
-  (ebitda "msft")
-  ;; => 71.69
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/ebitda]))
 
 (defn net-income-avi-to-common [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^net income avi to common$")
        (->value)))
 
+(p/reg-resolver ::net-income-avi-to-common
+  [{:yf/keys [ticker]}]
+  {:yf/net-income-avi-to-common (net-income-avi-to-common ticker)})
+
 (comment
-  (net-income-avi-to-common "msft")
-  ;; => 51.31
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/net-income-avi-to-common]))
 
 (defn diluted-eps [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^diluted eps")
        (->value)))
 
-(comment
-  (diluted-eps "msft")
-  ;; => 6.2
-  )
-
-(defn quarterly-earnings-growth [symbol]
-  (->> (get-key-stats-htree symbol)
-       (find-value-by-description #"(?i)^quarterly earnings growth$")
-       (->value)))
+(p/reg-resolver ::diluted-eps
+  [{:yf/keys [ticker]}]
+  {:yf/diluted-eps (diluted-eps ticker)})
 
 (comment
-  (quarterly-earnings-growth "msft")
-  ;; => 32.7
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/diluted-eps]))
 
 (defn total-cash [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^total cash$")
        (->value)))
 
+(p/reg-resolver ::total-cash
+  [{:yf/keys [ticker]}]
+  {:yf/total-cash (total-cash ticker)})
+
 (comment
-  (total-cash "msft")
-  ;; => 131.97
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/total-cash]))
+
+(defn quarterly-earnings-growth [symbol]
+  (->> (get-key-stats-htree symbol)
+       (find-value-by-description #"(?i)^quarterly earnings growth$")
+       (->value)))
+
+(p/reg-resolver ::quarterly-earnings-growth
+  [{:yf/keys [ticker]}]
+  {:yf/quarterly-earnings-growth (quarterly-earnings-growth ticker)})
+
+(comment
+  (p/eql {:yf/ticker "msft"} [:yf/quarterly-earnings-growth]))
 
 (defn total-cash-per-share [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^total cash per share$")
        (->value)))
 
+(p/reg-resolver ::total-cash-per-share
+  [{:yf/keys [ticker]}]
+  {:yf/total-cash-per-share (total-cash-per-share ticker)})
+
 (comment
-  (total-cash-per-share "msft")
-  ;; => 17.49
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/total-cash-per-share]))
 
 (defn total-debt [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^total debt$")
        (->value)))
 
+(p/reg-resolver ::total-debt
+  [{:yf/keys [ticker]}]
+  {:yf/total-debt (total-debt ticker)})
+
 (comment
-  (total-debt "msft")
-  ;; => 69.4
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/total-debt]))
 
 (defn total-debt-to-equity [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^total debt/equity$")
        (->value)))
 
+(p/reg-resolver ::total-debt-to-equity
+  [{:yf/keys [ticker]}]
+  {:yf/total-debt-to-equity (total-debt-to-equity ticker)})
+
 (comment
-  (total-debt-to-equity "msft")
-  ;; => 53.29
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/total-debt-to-equity]))
 
 (defn current-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^current ratio$")
        (->value)))
 
+(p/reg-resolver ::current-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/current-ratio (current-ratio ticker)})
+
 (comment
-  (current-ratio "msft")
-  ;; => 2.58
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/current-ratio]))
 
 (defn book-value-per-share [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^book value per share$")
        (->value)))
 
+(p/reg-resolver ::book-value-per-share
+  [{:yf/keys [ticker]}]
+  {:yf/book-value-per-share (book-value-per-share ticker)})
+
 (comment
-  (book-value-per-share "msft")
-  ;; => 16.31
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/book-value-per-share]))
 
 (defn operating-cash-flow [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^operating cash flow$")
        (->value)))
 
+(p/reg-resolver ::operating-cash-flow
+  [{:yf/keys [ticker]}]
+  {:yf/operating-cash-flow (operating-cash-flow ticker)})
+
 (comment
-  (operating-cash-flow "msft")
-  ;; => 68.03
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/operating-cash-flow]))
 
 (defn levered-free-cash-flow [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^levered free cash flow$")
        (->value)))
 
+(p/reg-resolver ::levered-free-cash-flow
+  [{:yf/keys [ticker]}]
+  {:yf/levered-free-cash-flow (levered-free-cash-flow ticker)})
+
 (comment
-  (levered-free-cash-flow "msft")
-  ;; => 36.83
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/levered-free-cash-flow]))
 
 (defn beta [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^beta \(5y monthly\)$")
        (->value)))
 
+(p/reg-resolver ::beta
+  [{:yf/keys [ticker]}]
+  {:yf/beta (beta ticker)})
+
 (comment
-  (beta "msft")
-  ;; => nil
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/beta]))
 
 (defn week-change-52 [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^52\-week change$")
        (->value)))
 
+(p/reg-resolver ::week-change-52
+  [{:yf/keys [ticker]}]
+  {:yf/week-change-52 (week-change-52 ticker)})
+
 (comment
-  (week-change-52 "msft")
-  ;; => 38.26
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/week-change-52]))
 
 (defn s&p500-week-change-52 [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^s&p500 52\-week change$")
        (->value)))
 
+(p/reg-resolver ::s&p500-week-change-52
+  [{:yf/keys [ticker]}]
+  {:yf/s&p500-week-change-52 (s&p500-week-change-52 ticker)})
+
 (comment
-  (s&p500-week-change-52 "msft")
-  ;; => 17.6
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/s&p500-week-change-52]))
 
 (defn week-high-52 [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^52 week high$")
        (->value)))
 
+(p/reg-resolver ::week-high-52
+  [{:yf/keys [ticker]}]
+  {:yf/week-high-52 (week-high-52 ticker)})
+
 (comment
-  (week-high-52 "msft")
-  ;; => 240.18
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/week-high-52]))
 
 (defn week-low-52 [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^52 week low$")
        (->value)))
 
+(p/reg-resolver ::week-low-52
+  [{:yf/keys [ticker]}]
+  {:yf/week-low-52 (week-low-52 ticker)})
+
 (comment
-  (week-low-52 "msft")
-  ;; => 132.52
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/week-low-52]))
 
 (defn day-ma-50 [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^50\-day moving average$")
        (->value)))
 
+(p/reg-resolver ::day-ma-50
+  [{:yf/keys [ticker]}]
+  {:yf/day-ma-50 (day-ma-50 ticker)})
+
 (comment
-  (day-ma-50 "msft")
-  ;; => 219.23
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/day-ma-50]))
 
 (defn day-ma-200 [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^200\-day moving average$")
        (->value)))
 
+(p/reg-resolver ::day-ma-200
+  [{:yf/keys [ticker]}]
+  {:yf/day-ma-200 (day-ma-200 ticker)})
+
 (comment
-  (day-ma-200 "msft")
-  ;; => 213.48
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/day-ma-200]))
 
 (defn avg-vol-3-month [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^avg vol \(3 month\)$")
        (->value)))
 
+(p/reg-resolver ::avg-vol-3-month
+  [{:yf/keys [ticker]}]
+  {:yf/avg-vol-3-month (avg-vol-3-month ticker)})
+
 (comment
-  (avg-vol-3-month "msft")
-  ;; => 29.2
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/avg-vol-3-month]))
 
 (defn avg-vol-10-day [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^avg vol \(10 day\)$")
        (->value)))
 
+(p/reg-resolver ::avg-vol-10-day
+  [{:yf/keys [ticker]}]
+  {:yf/avg-vol-10-day (avg-vol-10-day ticker)})
+
 (comment
-  (avg-vol-10-day "msft")
-  ;; => 35.17
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/avg-vol-10-day]))
 
 (defn shares-outstanding [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^shares outstanding$")
        (->value)))
 
+(p/reg-resolver ::shares-outstanding
+  [{:yf/keys [ticker]}]
+  {:yf/shares-outstanding (shares-outstanding ticker)})
+
 (comment
-  (shares-outstanding "msft")
-  ;; => 7.56
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/shares-outstanding]))
 
 (defn float [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^float$")
        (->value)))
 
+(p/reg-resolver ::float
+  [{:yf/keys [ticker]}]
+  {:yf/float (float ticker)})
+
 (comment
-  (float "msft")
-  ;; => 7.44
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/float]))
 
 (defn percent-held-by-insiders [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^\% held by insiders$")
        (->value)))
 
+(p/reg-resolver ::percent-held-by-insiders
+  [{:yf/keys [ticker]}]
+  {:yf/percent-held-by-insiders (percent-held-by-insiders ticker)})
+
 (comment
-  (percent-held-by-insiders "msft")
-  ;; => 0.06
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/percent-held-by-insiders]))
 
 (defn percent-held-by-institutions [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^\% held by institutions$")
        (->value)))
 
+(p/reg-resolver ::percent-held-by-institutions
+  [{:yf/keys [ticker]}]
+  {:yf/percent-held-by-institutions (percent-held-by-institutions ticker)})
+
 (comment
-  (percent-held-by-institutions "msft")
-  ;; => 71.84
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/percent-held-by-institutions]))
 
 (defn shares-short [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^shares short \(.+\)$")
        (->value)))
 
+(p/reg-resolver ::shares-short
+  [{:yf/keys [ticker]}]
+  {:yf/shares-short (shares-short ticker)})
+
 (comment
-  (shares-short "msft")
-  ;; => 39.2
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/shares-short]))
 
 (defn short-ratio [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^short ratio \(.+\)$")
        (->value)))
 
+(p/reg-resolver ::short-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/short-ratio (short-ratio ticker)})
+
 (comment
-  (short-ratio "msft")
-  ;; => 1.44
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/short-ratio]))
 
 (defn short-percent-of-float [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^short \% of float \(.+\)$")
        (->value)))
 
+(p/reg-resolver ::short-percent-of-float
+  [{:yf/keys [ticker]}]
+  {:yf/short-percent-of-float (short-percent-of-float ticker)})
+
 (comment
-  (short-percent-of-float "msft")
-  ;; => 0.52
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/short-percent-of-float]))
 
 (defn short-percent-of-shares-outstanding [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^short \% of shares outstanding \(.+\)$")
        (->value)))
 
+(p/reg-resolver ::short-percent-of-shares-outstanding
+  [{:yf/keys [ticker]}]
+  {:yf/short-percent-of-shares-outstanding (short-percent-of-shares-outstanding ticker)})
+
 (comment
-  (short-percent-of-shares-outstanding "msft")
-  ;; => 0.52
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/short-percent-of-shares-outstanding]))
 
 (defn forward-annual-dividend-rate [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^forward annual dividend rate$")
        (->value)))
 
+(p/reg-resolver ::forward-annual-dividend-rate
+  [{:yf/keys [ticker]}]
+  {:yf/forward-annual-dividend-rate (forward-annual-dividend-rate ticker)})
+
 (comment
-  (forward-annual-dividend-rate "msft")
-  ;; => 2.24
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/forward-annual-dividend-rate]))
 
 (defn forward-annual-dividend-yield [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^forward annual dividend yield$")
        (->value)))
 
+(p/reg-resolver ::forward-annual-dividend-yield
+  [{:yf/keys [ticker]}]
+  {:yf/forward-annual-dividend-yield (forward-annual-dividend-yield ticker)})
+
 (comment
-  (forward-annual-dividend-yield "msft")
-  ;; => 0.96
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/forward-annual-dividend-yield]))
 
 (defn trailing-annual-dividend-rate [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^trailing annual dividend rate$")
        (->value)))
 
+(p/reg-resolver ::trailing-annual-dividend-rate
+  [{:yf/keys [ticker]}]
+  {:yf/trailing-annual-dividend-rate (trailing-annual-dividend-rate ticker)})
+
 (comment
-  (trailing-annual-dividend-rate "msft")
-  ;; => 2.09
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/trailing-annual-dividend-rate]))
 
 (defn trailing-annual-dividend-yield [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^trailing annual dividend yield$")
        (->value)))
 
-(comment
-  (trailing-annual-dividend-yield "msft")
-  ;; => 0.9
-  )
+(p/reg-resolver ::trailing-annual-dividend-yield
+  [{:yf/keys [ticker]}]
+  {:yf/trailing-annual-dividend-yield (trailing-annual-dividend-yield ticker)})
 
-(defn _5-year-average-dividend-yield  [symbol]
+(comment
+  (p/eql {:yf/ticker "msft"} [:yf/trailing-annual-dividend-yield]))
+
+(defn five-year-average-dividend-yield  [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^5 year average dividend yield$")
        (->value)))
 
+(p/reg-resolver ::five-year-average-dividend-yield
+  [{:yf/keys [ticker]}]
+  {:yf/five-year-average-dividend-yield (five-year-average-dividend-yield ticker)})
+
 (comment
-  (_5-year-average-dividend-yield "msft")
-  ;; => 1.74
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/five-year-average-dividend-yield]))
 
 (defn payout-ratio  [symbol]
   (->> (get-key-stats-htree symbol)
        (find-value-by-description #"(?i)^payout ratio$")
        (->value)))
 
+(p/reg-resolver ::payout-ratio
+  [{:yf/keys [ticker]}]
+  {:yf/payout-ratio (payout-ratio ticker)})
+
 (comment
-  (payout-ratio "msft")
-  ;; => 32.9
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/payout-ratio]))
 
 (defn dividend-date  [symbol]
   (when-let [s (->> (get-key-stats-htree symbol)
                     (find-value-by-description #"(?i)^dividend date$"))]
-    (when (string? s) (jt/local-date "LLL dd, yyyy" s))))
+    (when (string? s)
+      (.format
+       (e/simple-date-format "yyyy-MM-dd" :timezone :utc)
+       (.parse (e/simple-date-format "LLL dd, yyyy" :timezone :utc) s)))))
+
+(p/reg-resolver ::dividend-date
+  [{:yf/keys [ticker]}]
+  {:yf/dividend-date (dividend-date ticker)})
 
 (comment
-  (dividend-date "msft")
-  ;; => #object[java.time.LocalDate 0x14e97ac6 "2021-03-10"]
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/dividend-date]))
 
 (defn ex-dividend-date  [symbol]
   (when-let [s (->> (get-key-stats-htree symbol)
                     (find-value-by-description #"(?i)^ex-dividend date$"))]
-    (when (string? s) (jt/local-date "LLL dd, yyyy" s))))
+    (when (string? s)
+      (.format
+       (e/simple-date-format "yyyy-MM-dd" :timezone :utc)
+       (.parse (e/simple-date-format "LLL dd, yyyy" :timezone :utc) s)))))
+
+(p/reg-resolver ::ex-dividend-date
+  [{:yf/keys [ticker]}]
+  {:yf/ex-dividend-date (ex-dividend-date ticker)})
 
 (comment
-  (ex-dividend-date "msft")
-  ;; => #object[java.time.LocalDate 0x4a8632d8 "2021-02-16"]
-  )
-
-(defn valuation [symbol]
-  (when (stock? symbol)
-    {:market-cap                  (market-cap symbol)
-     :enterprise-value            (enterprise-value symbol)
-     :trailing-price-to-earnings  (trailing-pe-ratio symbol)
-     :forward-price-to-earnings   (forward-pe-ratio symbol)
-     :peg-ratio                   (peg-ratio symbol)
-     :price-to-sales              (price-to-sales-ratio symbol)
-     :price-to-book               (price-to-book-ratio symbol)
-     :enterprise-value-to-revenue (enterprise-value-to-revenue-ratio symbol)
-     :enterprise-value-to-ebitda  (enterprise-value-to-ebitda-ratio symbol)}))
-
-(comment
-  (valuation "msft")
-  ;; =>
-  ;; {:forward-price-to-earnings 31.93,
-  ;;  :market-cap 1.81,
-  ;;  :price-to-book 1.69,
-  ;;  :enterprise-value-to-revenue 11.03,
-  ;;  :price-to-sales 11.78,
-  ;;  :enterprise-value 1.69,
-  ;;  :enterprise-value-to-ebitda 23.58,
-  ;;  :trailing-price-to-earnings 38.53,
-  ;;  :peg-ratio 2.28}
-  )
-
-(defn fiscal-year [symbol]
-  (when (stock? symbol)
-    {:fiscal-year-ends    (fiscal-year-ends symbol)
-     :most-recent-quarter (most-recent-quarter symbol)}))
-
-(comment
-  (fiscal-year "msft")
-  ;; =>
-  ;; {:fiscal-year-ends #object[java.time.LocalDate
-  ;;                            0x3dfb1e92
-  ;;                            "2020-06-29"]
-  ;;  , :most-recent-quarter
-  ;;  #object[java.time.LocalDate
-  ;;          0x1640f2f5
-  ;;          "2020-12-30"]}
-  )
-
-(defn profitability [symbol]
-  (when (stock? symbol)
-    {:profit-margin    (profit-margin symbol)
-     :operating-margin (operating-margin symbol)}))
-
-(comment
-  (profitability "msft")
-  ;; => {:profit-margin 33.47, :operating-margin 39.24}
-  )
-
-(defn management-effectivness [symbol]
-  (when (stock? symbol)
-    {:roa (roa symbol)
-     :roe (roe symbol)}))
-
-(comment
-  (management-effectivness "msft")
-  ;; => {:roa 12.81, :roe 42.7}
-  )
-
-(defn income-statement [symbol]
-  (when (stock? symbol)
-    {:revenue                   (revenue symbol)
-     :rps                       (revenue-per-share symbol)
-     :quarterly-revenue-growth  (quarterly-revenue-growth symbol)
-     :gross-profit              (gross-profit symbol)
-     :ebitda                    (ebitda symbol)
-     :net-income-avi-to-common  (net-income-avi-to-common symbol)
-     :diluted-eps               (diluted-eps symbol)
-     :quarterly-earnings-growth (quarterly-earnings-growth symbol)}))
-
-(comment
-  (income-statement "msft")
-  ;; =>
-  ;; {:revenue 153.28,
-  ;;  :rps 20.23,
-  ;;  :quarterly-revenue-growth 16.7,
-  ;;  :gross-profit 96.94,
-  ;;  :ebitda 71.69,
-  ;;  :net-income-avi-to-common 51.31,
-  ;;  :diluted-eps 6.2,
-  ;;  :quarterly-earnings-growth 32.7}
-  )
-
-(defn balance-sheet [symbol]
-  (when (stock? symbol)
-    {:total-cash           (total-cash symbol)
-     :total-cash-per-share (total-cash-per-share symbol)
-     :total-debt           (total-debt symbol)
-     :total-debt-to-equity (total-debt-to-equity symbol)
-     :current-ratio        (current-ratio symbol)
-     :book-value-per-share (book-value-per-share symbol)}))
-
-(comment
-  (balance-sheet "msft")
-  ;; =>
-  ;; {:total-cash 131.97,
-  ;;  :total-cash-per-share 17.49,
-  ;;  :total-debt 69.4,
-  ;;  :total-debt-to-equity 53.29,
-  ;;  :current-ratio 2.58,
-  ;;  :book-value-per-share 16.31}
-  )
-
-(defn cash-flow-statement [symbol]
-  (when (stock? symbol)
-    {:operating-cash-flow    (operating-cash-flow symbol)
-     :levered-free-cash-flow (levered-free-cash-flow symbol)}))
-
-(comment
-  (cash-flow-statement "msft")
-  ;; => {:operating-cash-flow 68.03, :levered-free-cash-flow 36.83}
-  )
-
-(defn stock-price-history [symbol]
-  (when (stock? symbol)
-    {:beta                 (beta symbol)
-     :week-change-52       (week-change-52 symbol)
-     :sp500-52-week-change (s&p500-week-change-52 symbol)
-     :week-high-52         (week-high-52 symbol)
-     :week-low-52          (week-low-52 symbol)
-     :day-ma-50            (day-ma-50 symbol)
-     :day-ma-200           (day-ma-200 symbol)}))
-
-(comment
-  (stock-price-history "msft")
-  ;; =>
-  ;; {:beta nil,
-  ;;  :week-change-52 38.26,
-  ;;  :sp500-52-week-change 17.6,
-  ;;  :week-high-52 240.18,
-  ;;  :week-low-52 132.52,
-  ;;  :day-ma-50 219.23,
-  ;;  :day-ma-200 213.48}
-  )
-
-(defn share-statistics [symbol]
-  (when (stock? symbol)
-    {:avg-vol-3-month                     (avg-vol-3-month symbol)
-     :avg-vol-10-day                      (avg-vol-10-day symbol)
-     :shares-outstanding                  (shares-outstanding symbol)
-     :float                               (float symbol)
-     :percent-held-by-insiders            (percent-held-by-insiders symbol)
-     :percent-held-by-institutions        (percent-held-by-institutions symbol)
-     :shares-short                        (shares-short symbol)
-     :short-ratio                         (short-ratio symbol)
-     :short-percent-of-float              (short-percent-of-float symbol)
-     :short-percent-of-shares-outstanding (short-percent-of-shares-outstanding symbol)}))
-
-(comment
-  (share-statistics "msft")
-  ;; =>
-  ;; {:shares-outstanding 7.56,
-  ;;  :short-ratio 1.44,
-  ;;  :float 7.44,
-  ;;  :short-percent-of-shares-outstanding 0.52,
-  ;;  :avg-vol-3-month 29.2,
-  ;;  :percent-held-by-insiders 0.06,
-  ;;  :shares-short 39.2,
-  ;;  :short-percent-of-float 0.52,
-  ;;  :avg-vol-10-day 35.17,
-  ;;  :percent-held-by-institutions 71.84}
-  )
-
-(defn dividends [symbol]
-  (when (stock? symbol)
-    {:forward-annual-dividend-rate     (forward-annual-dividend-rate symbol)
-     :forward-annual-dividend-yield    (forward-annual-dividend-yield symbol)
-     :trailing-annual-dividend-rate    (trailing-annual-dividend-rate symbol)
-     :trailing-annual-dividend-yield   (trailing-annual-dividend-yield symbol)
-     :five-year-average-dividend-yield (_5-year-average-dividend-yield symbol)
-     :payout-ratio                     (payout-ratio symbol)
-     :dividend-date                    (dividend-date symbol)
-     :ex-dividend-date                 (ex-dividend-date symbol)}))
-
-(comment
-  (dividends "msft")
-  ;; =>
-  ;; {:forward-annual-dividend-rate 2.24,
-  ;;  :forward-annual-dividend-yield 0.96,
-  ;;  :trailing-annual-dividend-rate 2.09,
-  ;;  :trailing-annual-dividend-yield 0.9,
-  ;;  :five-year-average-dividend-yield 1.74,
-  ;;  :payout-ratio 32.9,
-  ;;  :dividend-date #object[java.time.LocalDate
-  ;;                         0xcd1f7f1
-  ;;                         "2021-03-10"]
-  ;;  , :ex-dividend-date
-  ;;  #object[java.time.LocalDate
-  ;;          0x75b24a5
-  ;;          "2021-02-16"]}
-  )
+  (p/eql {:yf/ticker "msft"} [:yf/ex-dividend-date]))
 
 (def ^:private get-profile-htree
   (e/memoize
-      (fn [symbol]
-        (let [resp (memoized-http-get (format "https://finance.yahoo.com/quote/%s/profile" (str/upper symbol)))]
+      (fn [ticker]
+        (let [resp (memoized-http-get (format "https://finance.yahoo.com/quote/%s/profile" (str/upper ticker)))]
           (when-not (seq (:trace-redirects resp))
             (-> resp
                 :body
                 hc/parse
                 hc/as-hickory))))))
 
-(defn company-name [symbol]
-  (when (stock? symbol)
-    (->> (get-profile-htree symbol)
+(defn company-name [ticker]
+  (when (stock? ticker)
+    (->> (get-profile-htree ticker)
          (hs/select (hs/descendant
                      (hs/attr :data-test #(= % "asset-profile"))
                      (hs/tag :h3)))
@@ -906,14 +857,16 @@
          first
          str/lower)))
 
-(comment
-  (company-name "msft")
-  ;; => microsoft corporation
-  )
+(p/reg-resolver ::company-name
+  [{:yf/keys [ticker]}]
+  {:yf.company/name (company-name ticker)})
 
-(defn company-address [symbol]
-  (when (stock? symbol)
-    (->> (get-profile-htree symbol)
+(comment
+  (p/eql {:yf/ticker "msft"} [:yf.company/name]))
+
+(defn company-address [ticker]
+  (when (stock? ticker)
+    (->> (get-profile-htree ticker)
          (hs/select (hs/descendant
                      (hs/attr :data-test #(= % "asset-profile"))
                      (hs/tag :div)
@@ -922,34 +875,19 @@
          :content
          (filter string?)
          ((fn [[street city country]]
-            {:street  (some-> street (str/lower))
-             :city    (some-> city (str/lower))
-             :country (some-> country (str/lower))})))))
+            {:yf.company.address/street  (some-> street (str/lower))
+             :yf.company.address/city    (some-> city (str/lower))
+             :yf.company.address/country (some-> country (str/lower))})))))
+
+(p/reg-resolver ::company-address
+  [{:yf/keys [ticker]}]
+  {::p/output [:yf.company.address/street
+               :yf.company.address/city
+               :yf.company.address/country]}
+  (company-address ticker))
 
 (comment
-  (company-address "msft")
-  ;; =>
-  ;; {:street "one microsoft way"
-  ;;  , :city
-  ;;  "redmond, wa 98052-6399" ,
-  ;;  :country "united states"}
-  )
-
-(defn company-info [symbol]
-  (when (stock? symbol)
-    (merge {:name (company-name symbol)}
-           (company-address symbol))))
-
-(comment
-  (company-info "msft")
-  ;; =>
-  ;; {:name "microsoft corporation"
-  ;;  , :street
-  ;;  "one microsoft way" ,
-  ;;  :city "redmond, wa 98052-6399"
-  ;;  , :country
-  ;;  "united states"}
-  )
+  (p/eql {:yf/ticker "msft"} [:yf.company.address/street]))
 
 (defn company-profile [symbol]
   (->> (get-profile-htree (str/upper symbol))
@@ -961,18 +899,22 @@
        :content
        (mapv :content)
        ((fn [{[sector _] 4 [industry _] 10 [employees _] 16}]
-          {:sector    (some-> sector (str/lower))
-           :industry  (some-> industry (str/lower))
-           :employees (some-> employees :content first (str/replace "," "") (e/as-?float))}))))
+          {:yf.company/sector    (some-> sector (str/lower))
+           :yf.company/industry  (some-> industry (str/lower))
+           :yf.company/employees (some-> employees :content first (str/replace "," "") (e/as-?float))}))))
+
+(p/reg-resolver ::company-profile
+  [{:yf/keys [ticker]}]
+  {::p/output [:yf.company/sector
+               :yf.company/industry
+               :yf.company/employees]}
+  (company-profile ticker))
 
 (comment
-  (company-profile "msft")
-  ;; =>
-  ;; {:sector "technology", :industry "software—infrastructure", :employees 163000.0}
-  )
+  (p/eql {:yf/ticker "msft"} [:yf.company/sector]))
 
-(defn symbol-name [symbol]
-  (->> (memoized-http-get (str "https://finance.yahoo.com/quote/" (str/upper symbol)))
+(defn ticker-name [ticker]
+  (->> (memoized-http-get (str "https://finance.yahoo.com/quote/" (str/upper ticker)))
        :body
        (hc/parse)
        (hc/as-hickory)
@@ -985,78 +927,9 @@
        str/lower
        ((fn [s] (-> s (str/split #"-") second (str/trim))))))
 
-(comment
-  (symbol-name "msft")
-  ;; => microsoft corporation
-  )
-
-(->> (http/get "https://finance.yahoo.com/quote/MSFT/options")
-     :body
-     (hc/parse)
-     (hc/as-hickory)
-     (hs/select (hs/tag :select)))
+(p/reg-resolver ::ticker-name
+  [{:yf/keys [ticker]}]
+  {:yf/ticker-name (ticker-name ticker)})
 
 (comment
-  (http/get "msft")
-  ;; => error: java.net.MalformedURLException: no protocol: msft
-  )
-
-(defn- parse-options [data]
-  (m/match data
-    {:option-chain
-     {:result
-      [(m/some {:underlying-symbol ?symbol
-                :expiration-dates  ?dates
-                :options           [{:calls [{:volume !calls-volume
-                                              :strike !calls-strike} ...]
-                                     :puts  [{:volume !puts-volume
-                                              :strike !puts-strike} ...]} & _]})
-       & _]}}
-    {:expiration-dates ?dates
-     :calls-volume     (->> !calls-volume (mapv #(or % 0)))
-     :calls-strike     !calls-strike
-     :puts-volume      (->> !puts-volume (mapv #(or % 0)))
-     :puts-strike      !puts-strike}))
-
-(defn- -options
-  ([symbol date]
-   (m/match date
-     :all
-     (let [base  (-options symbol)
-           dates (-> base :expiration-dates (rest))
-           {:keys [calls-volume calls-strike
-                   puts-volume puts-strike]}
-           (reduce
-             (fn [acc date]
-               (let [{:keys [calls-volume calls-strike
-                             puts-volume puts-strike]} (-options symbol date)]
-                 (-> acc
-                     (update :calls-volume into calls-volume)
-                     (update :calls-strike into calls-strike)
-                     (update :puts-volume into puts-volume)
-                     (update :puts-strike into puts-strike))))
-             base dates)]
-       {:calls-delta (/ (reduce + (mapv * calls-volume calls-strike))
-                        (reduce + calls-volume))
-        :puts-delta  (/ (reduce + (mapv * puts-volume puts-strike))
-                        (reduce + puts-volume))})
-     _
-     (-> (http/get (format "https://query1.finance.yahoo.com/v7/finance/options/%s?date=%s" (name symbol) date))
-         :body
-         (json/read-value json/keyword-keys-object-mapper)
-         (parse-options))))
-  ([symbol]
-   (-> (http/get (format "https://query1.finance.yahoo.com/v7/finance/options/%s" (name symbol)))
-       :body
-       (json/read-value json/keyword-keys-object-mapper))))
-
-(comment
-  (-options "msft"))
-
-(defn options-expiration-dates [symbol]
-  (-> (-options symbol)
-      (parse-options)
-      :expiration-dates))
-(-options "msft")
-;; =>
-;; {:expiration-dates [1603411200 1604016000 1604620800 1605225600 1605830400 1606435200 1608249600 1610668800 1613692800 1616112000 1618531200 1623974400 1626393600 1631836800 1642723200 1647561600 1655424000 1663286400 1674172800], :calls-volume 208191, :puts-volume 93067, :delta-volume 115124}
+  (p/eql {:yf/ticker "msft"} [:yf/ticker-name]))
