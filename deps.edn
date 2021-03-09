@@ -2,5 +2,5 @@
  :deps  {hickory/hickory     {:mvn/version "0.7.1"}
          hato/hato           {:mvn/version "0.8.0"}
          com.taoensso/encore {:mvn/version "3.12.1"}
-         ribelo/pathos       {:git/url "https://github.com/ribelo/pathos"
-                              :sha     "fcdb735ee1b8cc43995f9beb81079025b995ffe2"}}}
+         com.wsscode/pathom3 {:git/url "https://github.com/wilkerlucio/pathom3"
+                              :sha     "96fc43469b4f1049dbbdc375d698e1c64e44de01"}}}
