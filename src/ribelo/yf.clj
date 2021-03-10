@@ -836,7 +836,7 @@
            hc/as-hickory)))})
 
 (pco/defresolver company-name [{:yf.profile-page/keys [htree]}]
-  {:yf.company/name
+  {:yf/company-name
    (some->> htree
             (hs/select (hs/descendant
                         (hs/attr :data-test #(= % "asset-profile"))
@@ -852,7 +852,7 @@
   )
 
 (pco/defresolver company-address [{:yf.profile-page/keys [htree]}]
-  {::pco/output [{:yf.company/address
+  {::pco/output [{:yf/company-address
                   [:yf.company.address/street
                    :yf.company.address/city
                    :yf.company.address/country]}]}
@@ -877,7 +877,7 @@
   )
 
 (pco/defresolver company-profile [{:yf.profile-page/keys [htree]}]
-  {:yf.company/profile
+  {:yf/company-profile
    (some->> htree
             (hs/select (hs/descendant
                         (hs/attr :data-test #(= % "asset-profile"))
@@ -887,9 +887,15 @@
             :content
             (mapv :content)
             ((fn [{[sector _] 4 [industry _] 10 [employees _] 16}]
-               {:yf.company.profile/sector    (some-> sector (str/lower-case))
-                :yf.company.profile/industry  (some-> industry (str/lower-case))
-                :yf.company.profile/employees (some-> employees :content first (str/replace "," "") (e/as-?float))})))})
+               {:yf/sector    (some-> sector (str/lower-case))
+                :yf/industry  (some-> industry (str/lower-case))
+                :yf/employees (some-> employees :content first (str/replace "," "") (e/as-?float))})))})
+
+(pco/defresolver company-profile* [{:yf/keys [company-profile]}]
+  {::pco/output [:yf/sector
+                 :yf/industry
+                 :yf/employees]}
+  company-profile)
 
 (comment
   (p.eql/process env {:yf/ticker "msft"} [{:yf.company/profile [:yf.company.profile/sector]}])
@@ -983,4 +989,5 @@
         company-name
         company-address
         company-profile
+        company-profile*
         ticker-name])))
