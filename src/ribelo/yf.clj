@@ -62,7 +62,7 @@
            (Thread/sleep ~sleep))
          (recur (inc i#))))))
 
-(defn- str-time->epoch [s]
+(defn- str-time->epoch ^long [s]
   (quot (.getTime (.parse (e/simple-date-format "yyyy-MM-dd" :timezone :utc) s)) 1000))
 
 (def ^:private memoized-http-get
@@ -106,6 +106,7 @@
                 (comp
                  (drop 1)
                  (map #(clojure.string/split % #","))
+                 (filter (fn [[date]] (>= (str-time->epoch date) start-time*)))
                  (map (fn [[date open high low close _ volume]]
                         {:date   date
                          :open   (e/as-?float open)
