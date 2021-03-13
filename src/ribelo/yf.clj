@@ -10,7 +10,9 @@
    [com.wsscode.pathom3.connect.operation :as pco]
    [com.wsscode.pathom3.connect.indexes :as pci]
    [com.wsscode.pathom3.connect.built-in.resolvers :as pbir]
-   [com.wsscode.pathom3.interface.eql :as p.eql]))
+   [com.wsscode.pathom3.interface.eql :as p.eql])
+  (:import
+   (java.net CookieHandler CookieManager)))
 
 (set! *warn-on-reflection* true)
 (set! *unchecked-math* :warn-on-boxed)
@@ -65,6 +67,8 @@
 (defn- str-time->epoch ^long [s]
   (quot (.getTime (.parse (e/simple-date-format "yyyy-MM-dd" :timezone :utc) s)) 1000))
 
+(def ^:private cookie-handler (do (CookieHandler/setDefault (CookieManager.)) (CookieHandler/getDefault)))
+
 (def ^:private memoized-http-get
   (e/memoize
     (fn
@@ -74,12 +78,12 @@
 (defn- get-crumb [ticker]
   (try-times {:max-retries 5 :sleep 3000}
     (let [url     "https://finance.yahoo.com/quote/%s/history"
-          resp    (http/get (format url (str/upper-case (name ticker))))
-          cookies (:cookies resp)
+          resp    (http/get (format url (str/upper-case (name ticker)))
+                            {:cookie-handler cookie-handler})
           body    (:body resp)
           crumb   (second (re-find #"\"CrumbStore\":\{\"crumb\":\"(.{11})\"\}" body))]
       (if crumb
-        [cookies crumb]
+        crumb
         (throw (ex-info "empty response" {:symbol ticker}))))))
 
 (defn- get-data
@@ -99,7 +103,8 @@
                             end-time*
                             interval
                             event
-                            crumb))
+                            crumb)
+                    {:cookie-handler cookie-handler})
           :body
           clojure.string/split-lines
           (into []
@@ -135,7 +140,8 @@
   [{:yf/keys [ticker]}]
   {::pco/cache-store ::ttl-cache}
   {:yf.quote.page/htree
-   (->> (http/get (str "https://finance.yahoo.com/quote/" (str/upper-case (name ticker))))
+   (->> (http/get (str "https://finance.yahoo.com/quote/" (str/upper-case (name ticker)))
+                  {:cookie-handler cookie-handler})
         :body
         hc/parse
         hc/as-hickory)})
@@ -166,7 +172,8 @@
   [{:yf/keys [ticker]}]
   {::pco/cache-store ::ttl-cache}
   {:yf.key-stats.page/htree
-   (->> (http/get (format "https://finance.yahoo.com/quote/%s/key-statistics" (str/upper-case (name ticker))))
+   (->> (http/get (format "https://finance.yahoo.com/quote/%s/key-statistics" (str/upper-case (name ticker)))
+                  {:cookie-handler cookie-handler})
         :body
         hc/parse
         hc/as-hickory)})
@@ -828,7 +835,8 @@
   [{:yf/keys [ticker]}]
   {::pco/cache-store ::ttl-cache}
   {:yf.profile-page/htree
-   (let [resp (http/get (format "https://finance.yahoo.com/quote/%s/profile" (str/upper-case ticker)))]
+   (let [resp (http/get (format "https://finance.yahoo.com/quote/%s/profile" (str/upper-case ticker))
+                        {:cookie-handler cookie-handler})]
      (when-not (seq (:trace-redirects resp))
        (-> resp
            :body
@@ -991,3 +999,8 @@
         company-profile
         company-profile*
         ticker-name])))
+
+(comment
+  (p.eql/process env {:ticker "jd"} [:yf/quotes])
+  (get-data "jd")
+  (get-crumb "jd"))
