@@ -3,6 +3,7 @@
   (:require
    [clojure.string :as str]
    [taoensso.encore :as e]
+   [taoensso.timbre :as timbre]
    [hato.client :as http]
    [hickory.core :as hc]
    [hickory.select :as hs]
@@ -53,11 +54,14 @@
 (defmacro try-times
   {:style/indent 1}
   [{:keys [max-retries sleep]} & body]
-  `(loop [i# 0]
+  `(loop [i# 1]
      (if-let [result# (try (or (do ~@body) true)
                            (catch Exception e#
-                             (when (>= i# ~max-retries)
-                               (throw e#))))]
+                             (timbre/warnf (str/lower-case (ex-message e#)))
+                             (timbre/warnf "attempt %d/%d" i# ~max-retries)
+                             (if (>= i# ~max-retries)
+                               (throw e#)
+                               (timbre/warnf "i'll try again in %d secs" (e/ms->secs ~sleep)))))]
        result#
        (do
          (when (e/pos-num? ~sleep)
@@ -76,12 +80,12 @@
       ([url] (memoized-http-get url {})))))
 
 (defn- get-crumb [ticker]
-  (try-times {:max-retries 5 :sleep 3000}
-    (let [url     "https://finance.yahoo.com/quote/%s/history"
-          resp    (http/get (format url (str/upper-case (name ticker)))
-                            {:cookie-handler cookie-handler})
-          body    (:body resp)
-          crumb   (second (re-find #"\"CrumbStore\":\{\"crumb\":\"(.{11})\"\}" body))]
+  (try-times {:max-retries 5 :sleep (e/ms :secs 5)}
+    (let [url   "https://finance.yahoo.com/quote/%s/history"
+          resp  (http/get (format url (str/upper-case (name ticker)))
+                          {:cookie-handler cookie-handler})
+          body  (:body resp)
+          crumb (second (re-find #"\"CrumbStore\":\{\"crumb\":\"(.{11})\"\}" body))]
       (if crumb
         crumb
         (throw (ex-info "empty response" {:symbol ticker}))))))
@@ -97,14 +101,15 @@
               start-time* (str-time->epoch start-time)
               end-time*   (str-time->epoch end-time)
               event       "history"]
-     (->> (http/get (format url
-                            (str/upper-case (name ticker))
-                            start-time*
-                            end-time*
-                            interval
-                            event
-                            crumb)
-                    {:cookie-handler cookie-handler})
+     (->> (try-times {:max-retries 10 :sleep (e/ms :secs 30)}
+            (http/get (format url
+                              (str/upper-case (name ticker))
+                              start-time*
+                              end-time*
+                              interval
+                              event
+                              crumb)
+                      {:cookie-handler cookie-handler}))
           :body
           clojure.string/split-lines
           (into []
@@ -140,8 +145,9 @@
   [{:yf/keys [ticker]}]
   {::pco/cache-store ::ttl-cache}
   {:yf.quote.page/htree
-   (->> (http/get (str "https://finance.yahoo.com/quote/" (str/upper-case (name ticker)))
-                  {:cookie-handler cookie-handler})
+   (->> (try-times {:max-retries 10 :sleep (e/ms :secs 30)}
+          (http/get (str "https://finance.yahoo.com/quote/" (str/upper-case (name ticker)))
+                    {:cookie-handler cookie-handler}))
         :body
         hc/parse
         hc/as-hickory)})
@@ -149,7 +155,7 @@
 (def stock?
   (e/memoize
     (fn [ticker]
-      (let [ticker (cond (map? ticker) (ticker :yf/ticker) (string? ticker) ticker)
+      (let [ticker                        (cond (map? ticker) (ticker :yf/ticker) (string? ticker) ticker)
             {:keys [yf.quote.page/htree]} (quote-page-htree {:yf/ticker ticker})]
         (->> htree
              (hs/select (hs/child
@@ -172,8 +178,9 @@
   [{:yf/keys [ticker]}]
   {::pco/cache-store ::ttl-cache}
   {:yf.key-stats.page/htree
-   (->> (http/get (format "https://finance.yahoo.com/quote/%s/key-statistics" (str/upper-case (name ticker)))
-                  {:cookie-handler cookie-handler})
+   (->> (try-times {:max-retries 10 :sleep (e/ms :secs 30)}
+          (http/get (format "https://finance.yahoo.com/quote/%s/key-statistics" (str/upper-case (name ticker)))
+                    {:cookie-handler cookie-handler}))
         :body
         hc/parse
         hc/as-hickory)})
@@ -835,8 +842,9 @@
   [{:yf/keys [ticker]}]
   {::pco/cache-store ::ttl-cache}
   {:yf.profile-page/htree
-   (let [resp (http/get (format "https://finance.yahoo.com/quote/%s/profile" (str/upper-case ticker))
-                        {:cookie-handler cookie-handler})]
+   (let [resp (try-times {:max-retries 10 :sleep (e/ms :secs 30)}
+                (http/get (format "https://finance.yahoo.com/quote/%s/profile" (str/upper-case ticker))
+                          {:cookie-handler cookie-handler}))]
      (when-not (seq (:trace-redirects resp))
        (-> resp
            :body
@@ -912,7 +920,8 @@
 
 (pco/defresolver ticker-name [{:yf/keys [ticker]}]
   {:yf/ticker-name
-   (some->> (http/get (str "https://finance.yahoo.com/quote/" (str/upper-case ticker)))
+   (some->> (try-times {:max-retries 10 :sleep (e/ms :secs 30)}
+              (http/get (str "https://finance.yahoo.com/quote/" (str/upper-case ticker))))
             :body
             (hc/parse)
             (hc/as-hickory)
